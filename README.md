@@ -22,31 +22,33 @@ flowchart LR
     APIGW["API Gateway HTTP API (AWS_IAM)"]
     API["API Lambda (Run submission, approvals, kill-switch)"]
     SFN["Step Functions: ChaosRunOrchestrator"]
-    DDB[(DynamoDB: Runs, Events, Templates, Plugins, Policies, Approvals, Accounts)]
-    S3[(Evidence S3 Bucket + KMS)]
-    SSM[(SSM Parameter Store\n/chaos/<env>/kill-switch)]
+    DDB["DynamoDB (Runs, Events, Templates, Plugins, Policies, Approvals, Accounts)"]
+    S3["Evidence S3 Bucket (KMS encrypted)"]
+    SSM["SSM Parameter Store (/chaos/{env}/kill-switch)"]
     CW["CloudWatch Alarms (control plane reads target alarms)"]
     PLUG["Plugin Lambdas (in control plane)"]
   end
 
   subgraph ORG["AWS Organizations"]
     OU["OUs"]
-    SS["Service‑Managed StackSet\n(target-baseline.yaml)"]
+    SS["Service-Managed StackSet (target-baseline.yaml)"]
   end
 
   subgraph TA["Target Accounts (many)"]
-    TR["IAM Roles via StackSet\nChaosTargetExecutionRole-EC2/SSM/ALB"]
+    TR["IAM Roles via StackSet (ChaosTargetExecutionRole-EC2/SSM/ALB)"]
     RES["Workloads: EC2, SSM-managed hosts, ALB/TGs, etc."]
     ALM["CloudWatch Alarms (required + stop alarms)"]
   end
 
   APIGW --> API
-  API <--> DDB
+  API --> DDB
+  DDB --> API
   API -->|StartExecution(runId)| SFN
 
   SFN -->|invoke| PLUG
   SFN -->|invoke| API
-  SFN <--> DDB
+  SFN --> DDB
+  DDB --> SFN
   SFN --> SSM
   SFN --> CW
   SFN --> S3
@@ -79,7 +81,7 @@ sequenceDiagram
   participant S3 as Evidence S3
 
   User->>API: POST /runs (templateId, env, accounts[], regions[], params)
-  API->>SSM: Check kill-switch (/chaos/<env>/kill-switch)
+  API->>SSM: Check kill-switch (/chaos/{env}/kill-switch)
   API->>DDB: Create Run + initial Events
   API->>SFN: StartExecution(runId)
 
@@ -257,7 +259,7 @@ go build -o bin/chaosforge ./cmd/chaosforge
 
 Seeder behavior:
 - Upserts **Accounts, Policies, Plugins, Templates**
-- Initializes `/chaos/<env>/kill-switch = DISENGAGED` for each env found in `policies:`
+- Initializes `/chaos/{env}/kill-switch = DISENGAGED` for each env found in `policies:`
 - Optionally verifies reads after writes
 
 ---
@@ -371,7 +373,7 @@ Events emitted include:
   - Verify StackSet instances succeeded in target accounts/regions
   - Verify ExternalId matches `<OrgName>/<Env>`
 - **Kill-switch engaged**:
-  - Set `/chaos/<env>/kill-switch = DISENGAGED` to allow new runs
+  - Set `/chaos/{env}/kill-switch = DISENGAGED` to allow new runs
 
 ---
 
