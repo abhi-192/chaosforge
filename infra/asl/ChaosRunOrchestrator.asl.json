@@ -1,0 +1,195 @@
+{
+  "Comment": "Chaos framework run orchestrator",
+  "StartAt": "LoadRun",
+  "States": {
+    "LoadRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "ChaosRuns",
+        "Key": { "runId": { "S.$": "$.runId" } }
+      },
+      "ResultPath": "$.run",
+      "Next": "CheckKillSwitchStart"
+    },
+    "CheckKillSwitchStart": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+      "Parameters": {
+        "Name.$": "States.Format('/chaos/{}/kill-switch', $.run.Item.env.S)",
+        "WithDecryption": false
+      },
+      "ResultPath": "$.kill",
+      "Next": "KillSwitchGateStart"
+    },
+    "KillSwitchGateStart": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.kill.Parameter.Value",
+          "StringEquals": "ENGAGED",
+          "Next": "AbortRun"
+        }
+      ],
+      "Default": "PlanTargets"
+    },
+    "PlanTargets": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PluginPlannerLambdaArn}",
+        "Payload": { "runId.$": "$.runId" }
+      },
+      "ResultPath": "$.plan",
+      "Next": "PreflightAlarms"
+    },
+    "PreflightAlarms": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AlarmCheckerLambdaArn}",
+        "Payload": { "runId.$": "$.runId", "mode": "preflight" }
+      },
+      "ResultPath": "$.preflight",
+      "Next": "PreflightGate"
+    },
+    "PreflightGate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.preflight.Payload.ok",
+          "BooleanEquals": true,
+          "Next": "ApprovalGate"
+        }
+      ],
+      "Default": "AbortRun"
+    },
+    "ApprovalGate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.run.Item.approvalRequired.BOOL",
+          "BooleanEquals": true,
+          "Next": "WaitForApproval"
+        }
+      ],
+      "Default": "Inject"
+    },
+    "WaitForApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "TimeoutSeconds": 86400,
+      "Parameters": {
+        "FunctionName": "${ApprovalWaiterLambdaArn}",
+        "Payload": {
+          "runId.$": "$.runId",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "Next": "Inject"
+    },
+    "Inject": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PluginExecutorLambdaArn}",
+        "Payload": { "runId.$": "$.runId", "action": "inject" }
+      },
+      "ResultPath": "$.inject",
+      "Next": "MonitorLoop"
+    },
+    "MonitorLoop": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${MonitorLambdaArn}",
+        "Payload": { "runId.$": "$.runId" }
+      },
+      "ResultPath": "$.monitor",
+      "Next": "MonitorGate"
+    },
+    "MonitorGate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.monitor.Payload.stopAlarmFired",
+          "BooleanEquals": true,
+          "Next": "Rollback"
+        },
+        {
+          "Variable": "$.monitor.Payload.done",
+          "BooleanEquals": true,
+          "Next": "PostCheck"
+        }
+      ],
+      "Default": "WaitBeforeMonitor"
+    },
+    "WaitBeforeMonitor": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "CheckKillSwitchLoop"
+    },
+    "CheckKillSwitchLoop": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+      "Parameters": {
+        "Name.$": "States.Format('/chaos/{}/kill-switch', $.run.Item.env.S)",
+        "WithDecryption": false
+      },
+      "ResultPath": "$.kill",
+      "Next": "KillSwitchGateLoop"
+    },
+    "KillSwitchGateLoop": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.kill.Parameter.Value",
+          "StringEquals": "ENGAGED",
+          "Next": "Rollback"
+        }
+      ],
+      "Default": "MonitorLoop"
+    },
+    "Rollback": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PluginExecutorLambdaArn}",
+        "Payload": { "runId.$": "$.runId", "action": "rollback" }
+      },
+      "ResultPath": "$.rollback",
+      "Next": "PostCheck"
+    },
+    "PostCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AlarmCheckerLambdaArn}",
+        "Payload": { "runId.$": "$.runId", "mode": "postcheck" }
+      },
+      "ResultPath": "$.post",
+      "Next": "Finalize"
+    },
+    "Finalize": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ReporterLambdaArn}",
+        "Payload": { "runId.$": "$.runId" }
+      },
+      "End": true
+    },
+    "AbortRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AbortLambdaArn}",
+        "Payload": {
+          "runId.$": "$.runId",
+          "reason": "Preflight failed or kill-switch engaged"
+        }
+      },
+      "End": true
+    }
+  }
+}

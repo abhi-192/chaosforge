@@ -1,0 +1,138 @@
+orgName: AcmeCorp
+
+controlPlane:
+  accountId: "111111111111"
+  region: us-east-1
+  stackName: ChaosForge-ControlPlane
+  artifacts:
+    bucket: my-chaosforge-artifacts-bucket
+    prefix: chaosforge
+  evidence:
+    bucket: ""      # filled after deploy (control plane stack creates one by default)
+    kmsKeyArn: ""   # filled after deploy
+
+stackSets:
+  permissionModel: service_managed
+  stackSetName: ChaosTargetBaseline
+  organizationalUnitIds:
+    - ou-abcd-12345678
+  regions:
+    - us-east-1
+    - us-west-2
+  autoDeployment:
+    enabled: true
+    retainStacksOnAccountRemoval: true
+  managedExecution:
+    active: true
+
+# Optional: explicit accounts (used mainly for metadata / role-name overrides)
+targetAccounts:
+  - accountId: "222222222222"
+    ouPath: /Engineering/Dev
+    enabled: true
+    allowedRegions: [us-east-1, us-west-2]
+    roleNames:
+      ec2: ChaosTargetExecutionRole-EC2
+      ssm: ChaosTargetExecutionRole-SSM
+      alb: ChaosTargetExecutionRole-ALB
+    tags:
+      owner: platform
+
+policies:
+  dev:
+    version: 1
+    requireApproval: false
+    maxRunDurationSeconds: 900
+    preflightWindowSeconds: 120
+    blastRadiusLimits:
+      ec2: { maxCount: 2, maxPercent: 10 }
+      ssm: { maxCount: 2, maxPercent: 10 }
+      alb: { maxCount: 1, maxPercent: 10 }
+    allowedPlugins: [ec2-stop, ec2-terminate, ssm-netem, ssm-stressng, alb-blackhole]
+    requiredTags: {}
+    denyTags: {}
+    freezeWindows: []
+
+  prod:
+    version: 1
+    requireApproval: true
+    maxRunDurationSeconds: 600
+    preflightWindowSeconds: 300
+    blastRadiusLimits:
+      ec2: { maxCount: 1, maxPercent: 5 }
+      ssm: { maxCount: 1, maxPercent: 5 }
+      alb: { maxCount: 1, maxPercent: 5 }
+    allowedPlugins: [ec2-stop, ssm-netem, ssm-stressng, alb-blackhole]
+    requiredTags: { chaos-ready: "true" }
+    denyTags: { do-not-chaos: "true" }
+    freezeWindows:
+      - name: weekday-office-hours
+        tz: Asia/Kolkata
+        daysOfWeek: [Mon, Tue, Wed, Thu, Fri]
+        start: "09:00"
+        end: "18:00"
+
+plugins:
+  - pluginId: ec2-stop
+    version: 1
+    lambdaName: plugin-ec2-stop
+    timeoutSeconds: 900
+    memoryMB: 512
+    requiredTargetRoleType: ec2
+  - pluginId: ec2-terminate
+    version: 1
+    lambdaName: plugin-ec2-terminate
+    timeoutSeconds: 900
+    memoryMB: 512
+    requiredTargetRoleType: ec2
+  - pluginId: ssm-netem
+    version: 1
+    lambdaName: plugin-ssm-netem
+    timeoutSeconds: 900
+    memoryMB: 512
+    requiredTargetRoleType: ssm
+  - pluginId: ssm-stressng
+    version: 1
+    lambdaName: plugin-ssm-stressng
+    timeoutSeconds: 900
+    memoryMB: 512
+    requiredTargetRoleType: ssm
+  - pluginId: alb-blackhole
+    version: 1
+    lambdaName: plugin-alb-blackhole
+    timeoutSeconds: 900
+    memoryMB: 512
+    requiredTargetRoleType: alb
+
+templates:
+  - templateId: stop-ec2-small
+    version: 1
+    name: Stop 1 EC2 instance
+    description: Stops up to 1 EC2 instance matching tags
+    envScope: any
+    status: APPROVED
+    pluginRef: ec2-stop@1
+    requiredAlarms: []
+    stopAlarms: []
+    defaultParams:
+      maxTargets: 1
+      targetTags:
+        chaos-ready: "true"
+      durationSeconds: 300
+    paramsSchema: {}
+
+  - templateId: alb-blackhole-small
+    version: 1
+    name: Deregister 1 target from a TG
+    description: Deregister up to 1 target from a target group matching tags
+    envScope: any
+    status: APPROVED
+    pluginRef: alb-blackhole@1
+    requiredAlarms: []
+    stopAlarms: []
+    defaultParams:
+      maxTargets: 1
+      targetGroupTags:
+        chaos-ready: "true"
+      durationSeconds: 300
+    paramsSchema: {}

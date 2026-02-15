@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ChaosForge Target Account Baseline (execution roles)
+
+Parameters:
+  ControlPlaneAccountId:
+    Type: String
+    Description: AWS account ID of the ChaosForge control plane
+  OrgName:
+    Type: String
+    Description: Organization name used in ExternalId (StringLike OrgName/*)
+  RolePrefix:
+    Type: String
+    Default: ChaosTargetExecutionRole
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${RolePrefix}-EC2'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${ControlPlaneAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                sts:ExternalId: !Sub '${OrgName}/*'
+      Policies:
+        - PolicyName: ChaosForgeEC2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:TerminateInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:SetDesiredCapacity
+                Resource: '*'
+
+  SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${RolePrefix}-SSM'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${ControlPlaneAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                sts:ExternalId: !Sub '${OrgName}/*'
+      Policies:
+        - PolicyName: ChaosForgeSSM
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListCommandInvocations
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+  ALBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${RolePrefix}-ALB'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${ControlPlaneAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                sts:ExternalId: !Sub '${OrgName}/*'
+      Policies:
+        - PolicyName: ChaosForgeALB
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:DeregisterTargets
+                Resource: '*'
+
+Outputs:
+  EC2RoleArn:
+    Value: !GetAtt EC2Role.Arn
+  SSMRoleArn:
+    Value: !GetAtt SSMRole.Arn
+  ALBRoleArn:
+    Value: !GetAtt ALBRole.Arn

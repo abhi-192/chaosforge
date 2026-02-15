@@ -1,0 +1,136 @@
+orgName: "Acme"
+
+controlPlane:
+  accountId: "111111111111"
+  region: "us-east-1"
+  stackName: "ChaosForge-ControlPlane"
+  artifacts:
+    bucket: "acme-chaosforge-artifacts"
+    prefix: "chaosforge"
+  evidence:
+    bucket: "acme-chaosforge-evidence"
+    kmsKeyArn: ""  # optional
+
+stackSets:
+  permissionModel: service_managed
+  stackSetName: "ChaosTargetBaseline"
+  organizationalUnitIds:
+    - "ou-xxxx-aaaaaaaa"
+  regions:
+    - "us-east-1"
+    - "us-west-2"
+  autoDeployment:
+    enabled: true
+    retainStacksOnAccountRemoval: false
+  managedExecution:
+    active: true
+
+# Optional explicit accounts list. If omitted, ChaosForge can enumerate accounts from OUs (requires org permissions).
+targetAccounts:
+  - accountId: "222222222222"
+    enabled: true
+    allowedRegions: ["us-east-1", "us-west-2"]
+    roleNames:
+      ec2: "ChaosTargetExecutionRole-EC2"
+      ssm: "ChaosTargetExecutionRole-SSM"
+      alb: "ChaosTargetExecutionRole-ALB"
+
+externalIdFormat: "${ORG}/${ENV}"  # required for sts:ExternalId condition
+
+# Policies stored in DynamoDB. Use versioning.
+policies:
+  dev:
+    version: 1
+    requireApproval: false
+    maxRunDurationSeconds: 1800
+    preflightWindowSeconds: 120
+    blastRadiusLimits:
+      ec2:
+        maxCount: 2
+        maxPercent: 10
+      alb:
+        maxCount: 2
+        maxPercent: 10
+      ssm:
+        maxCount: 2
+        maxPercent: 10
+    allowedPlugins: ["ec2-stop", "ec2-terminate", "ssm-netem", "ssm-stressng", "alb-blackhole"]
+    requiredTags:
+      chaos:enabled: "true"
+    denyTags: {}
+    freezeWindows: []
+
+  prod:
+    version: 1
+    requireApproval: true
+    maxRunDurationSeconds: 900
+    preflightWindowSeconds: 300
+    blastRadiusLimits:
+      ec2:
+        maxCount: 1
+        maxPercent: 1
+    allowedPlugins: ["ec2-stop", "ssm-netem", "ssm-stressng", "alb-blackhole"]
+    requiredTags:
+      chaos:enabled: "true"
+      env: "prod"
+    denyTags:
+      chaos:deny: "true"
+    freezeWindows:
+      - name: "weekdays-business-hours"
+        tz: "UTC"
+        daysOfWeek: ["MON","TUE","WED","THU","FRI"]
+        start: "09:00"
+        end: "18:00"
+
+plugins:
+  - pluginId: "ec2-stop"
+    version: 1
+    lambdaName: "ChaosPlugin-ec2-stop"
+    timeoutSeconds: 300
+    memoryMB: 256
+    requiredTargetRoleType: "ec2"
+
+  - pluginId: "ec2-terminate"
+    version: 1
+    lambdaName: "ChaosPlugin-ec2-terminate"
+    timeoutSeconds: 300
+    memoryMB: 256
+    requiredTargetRoleType: "ec2"
+
+  - pluginId: "ssm-netem"
+    version: 1
+    lambdaName: "ChaosPlugin-ssm-netem"
+    timeoutSeconds: 900
+    memoryMB: 256
+    requiredTargetRoleType: "ssm"
+
+  - pluginId: "ssm-stressng"
+    version: 1
+    lambdaName: "ChaosPlugin-ssm-stressng"
+    timeoutSeconds: 900
+    memoryMB: 256
+    requiredTargetRoleType: "ssm"
+
+  - pluginId: "alb-blackhole"
+    version: 1
+    lambdaName: "ChaosPlugin-alb-blackhole"
+    timeoutSeconds: 300
+    memoryMB: 256
+    requiredTargetRoleType: "alb"
+
+# Starter templates you can seed. Params schema is validated by the API.
+templates:
+  - templateId: "dev-ec2-stop"
+    version: 1
+    name: "Stop 1 EC2 instance"
+    description: "Simulate freeze by stopping a tagged instance"
+    envScope: "dev"
+    status: "APPROVED"
+    pluginRef: "ec2-stop@1"
+    requiredAlarms: []
+    stopAlarms: []
+    defaultParams:
+      targetTags:
+        chaos:enabled: "true"
+      maxTargets: 1
+
