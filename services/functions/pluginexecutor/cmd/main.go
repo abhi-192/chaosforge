@@ -3,16 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
-	"chaosforge/pkg/chaos/lambdautil"
 	"chaosforge/pkg/chaos/model"
+	"chaosforge/pkg/chaos/store"
 	"chaosforge/pkg/chaos/util"
 
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awslambda "github.com/aws/aws-sdk-go-v2/service/lambda"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/rs/zerolog/log"
 )
 
@@ -22,115 +24,136 @@ type input struct {
 }
 
 type output struct {
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
+	OK bool `json:"ok"`
 }
 
 type handler struct {
-	store modelStore
-	lmb   *awslambda.Client
-}
-
-type modelStore interface {
-	GetRun(context.Context, string) (*model.ChaosRun, error)
-	UpdateRun(context.Context, *model.ChaosRun) error
-	GetTemplate(context.Context, string, int) (*model.ChaosTemplate, error)
-	GetPlugin(context.Context, string, int) (*model.ChaosPlugin, error)
-	PutEvent(context.Context, *model.ChaosRunEvent) error
+	st *store.DynamoStore
+	lc *lambda.Client
 }
 
 func main() {
 	util.InitLogger("pluginexecutor")
-	cfg, err := lambdautil.LoadConfig(context.Background())
+	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		panic(err)
 	}
-	st := lambdautil.NewStoreFromEnv(cfg)
-	h := &handler{store: st, lmb: awslambda.NewFromConfig(cfg)}
-	lambda.Start(h.handle)
+	st := store.NewDynamo(dynamodb.NewFromConfig(cfg))
+	st.TemplatesTable = util.MustGetenv("CHAOS_TEMPLATES_TABLE")
+	st.PluginsTable = util.MustGetenv("CHAOS_PLUGINS_TABLE")
+	st.RunsTable = util.MustGetenv("CHAOS_RUNS_TABLE")
+	st.EventsTable = util.MustGetenv("CHAOS_EVENTS_TABLE")
+	lambda.Start((&handler{st: st, lc: lambda.NewFromConfig(cfg)}).Handle)
 }
 
-func (h *handler) handle(ctx context.Context, in input) (output, error) {
-	r, err := h.store.GetRun(ctx, in.RunID)
+func (h *handler) Handle(ctx context.Context, in input) (output, error) {
+	r, err := h.st.GetRun(ctx, in.RunID)
 	if err != nil {
-		return output{OK: false, Message: "run not found"}, nil
+		return output{OK: false}, err
 	}
-	tp, err := h.store.GetTemplate(ctx, r.TemplateID, r.TemplateVersion)
+	tpl, err := h.st.GetTemplate(ctx, r.TemplateID, r.TemplateVersion)
 	if err != nil {
-		return output{OK: false, Message: "template not found"}, nil
+		return output{OK: false}, err
 	}
-	pluginID, pluginVer, err := model.ParsePluginRef(tp.PluginRef)
+	pluginID, pluginVer, err := model.ParsePluginRef(tpl.PluginRef)
 	if err != nil {
-		return output{OK: false, Message: err.Error()}, nil
+		return output{OK: false}, err
 	}
-	pl, err := h.store.GetPlugin(ctx, pluginID, pluginVer)
+	pl, err := h.st.GetPlugin(ctx, pluginID, pluginVer)
 	if err != nil {
-		return output{OK: false, Message: "plugin not found"}, nil
+		return output{OK: false}, err
 	}
-	var targets []model.Target
-	if m, ok := r.Targets.(map[string]any); ok {
-		b, _ := json.Marshal(m["targets"])
-		_ = json.Unmarshal(b, &targets)
+
+	action := model.PluginAction(in.Action)
+	if action != model.PluginInject && action != model.PluginRollback {
+		return output{OK: false}, errors.New("invalid action")
 	}
-	action := model.PluginInject
-	if in.Action == "rollback" {
-		action = model.PluginRollback
+
+	if action == model.PluginInject {
+		r.State = model.RunRunning
+		now := time.Now().UTC()
+		r.StartedAt = &now
+	} else {
+		r.State = model.RunRollingBack
+		r.Rollback = map[string]any{"startedAt": time.Now().UTC().Format(time.RFC3339)}
 	}
+	_ = h.st.UpdateRun(ctx, r)
+
+	// best-effort decode planned targets
+	targets := make([]model.Target, 0)
+	b, _ := json.Marshal(r.Targets)
+	_ = json.Unmarshal(b, &targets)
+
 	preq := model.PluginRequest{
-		RunID:    r.RunID,
-		Action:   action,
-		Env:      r.Env,
-		Params:   r.Params,
+		RunID:   r.RunID,
+		Action:  action,
+		Env:     r.Env,
+		Params:  mergeParams(tpl.DefaultParams, r.Params),
 		Accounts: r.Accounts,
 		Regions:  r.Regions,
 		Targets:  targets,
-		Policy:   r.PolicySnapshot,
-		State:    r.PluginState,
+		Policy:  r.PolicySnapshot,
 	}
-	resp, err := h.invokePlugin(ctx, pl.LambdaArn, preq)
+	payload, _ := json.Marshal(preq)
+	inv, err := h.lc.Invoke(ctx, &lambda.InvokeInput{FunctionName: &pl.LambdaArn, Payload: payload})
 	if err != nil {
-		_ = h.store.PutEvent(ctx, &model.ChaosRunEvent{RunID: r.RunID, Type: model.EventInject, Message: "Plugin action failed", Details: map[string]any{"action": in.Action, "error": err.Error()}})
-		r.State = model.RunFailed
-		r.Outcome = "PLUGIN_FAILED"
-		_ = h.store.UpdateRun(ctx, r)
-		return output{OK: false, Message: err.Error()}, nil
+		return output{OK: false}, err
 	}
-	// Update state
-	if resp.State != nil {
-		r.PluginState = resp.State
+	if inv.FunctionError != nil {
+		log.Error().Str("fnerr", *inv.FunctionError).RawJSON("payload", inv.Payload).Msg("plugin exec failed")
+		return output{OK: false}, fmt.Errorf("plugin exec error")
 	}
-	now := time.Now().UTC()
-	if in.Action == "rollback" {
-		r.State = model.RunRollingBack
-		r.Rollback = map[string]any{"at": now.Format(time.RFC3339)}
-	} else {
-		r.State = model.RunRunning
-		if r.StartedAt == nil {
-			r.StartedAt = &now
+	var pres model.PluginResponse
+	if err := json.Unmarshal(inv.Payload, &pres); err != nil {
+		return output{OK: false}, err
+	}
+	if !pres.OK {
+		return output{OK: false}, fmt.Errorf("plugin returned not ok: %s", pres.Message)
+	}
+
+	// Persist plugin state
+	if r.PluginState == nil {
+		r.PluginState = map[string]any{}
+	}
+	// Merge state with existing for plugin
+	if cur, ok := r.PluginState[pluginID].(map[string]any); ok {
+		for k, v := range pres.State {
+			cur[k] = v
 		}
+		r.PluginState[pluginID] = cur
+	} else {
+		r.PluginState[pluginID] = pres.State
 	}
-	_ = h.store.PutEvent(ctx, &model.ChaosRunEvent{RunID: r.RunID, Type: model.EventInject, Message: fmt.Sprintf("Plugin %s complete", in.Action), Details: map[string]any{"action": in.Action}})
-	if err := h.store.UpdateRun(ctx, r); err != nil {
-		log.Error().Err(err).Msg("update run")
+	_ = h.st.UpdateRun(ctx, r)
+
+	// Write events
+	evType := model.EventInject
+	if action == model.PluginRollback {
+		evType = model.EventRollback
 	}
-	return output{OK: true, Message: "ok"}, nil
+	_ = h.st.PutEvent(ctx, &model.ChaosRunEvent{RunID: r.RunID, Type: evType, Message: fmt.Sprintf("Plugin %s %s", pluginID, action)})
+	for _, ev := range pres.Events {
+		ev.RunID = r.RunID
+		if ev.Type == "" {
+			ev.Type = evType
+		}
+		_ = h.st.PutEvent(ctx, &ev)
+	}
+
+	if action == model.PluginRollback {
+		r.Rollback["status"] = "DONE"
+		_ = h.st.UpdateRun(ctx, r)
+	}
+	return output{OK: true}, nil
 }
 
-func (h *handler) invokePlugin(ctx context.Context, arn string, req model.PluginRequest) (*model.PluginResponse, error) {
-	b, _ := json.Marshal(req)
-	out, err := h.lmb.Invoke(ctx, &awslambda.InvokeInput{FunctionName: aws.String(arn), Payload: b})
-	if err != nil {
-		return nil, err
+func mergeParams(defaults map[string]any, overrides map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range defaults {
+		out[k] = v
 	}
-	if out.FunctionError != nil {
-		return nil, fmt.Errorf("plugin error: %s", string(out.Payload))
+	for k, v := range overrides {
+		out[k] = v
 	}
-	var pr model.PluginResponse
-	if err := json.Unmarshal(out.Payload, &pr); err != nil {
-		return nil, err
-	}
-	if !pr.OK {
-		return nil, fmt.Errorf("plugin returned not ok: %s", pr.Message)
-	}
-	return &pr, nil
+	return out
 }

@@ -9,9 +9,9 @@ import (
 
 func NewRoot() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:           "chaosforge",
-		Short:         "ChaosForge control utilities (seed/deploy/validate)",
-		SilenceUsage:  true,
+		Use:          "chaosforge",
+		Short:        "ChaosForge control utilities (seed/deploy/validate)",
+		SilenceUsage: true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_ = cmd.Help()

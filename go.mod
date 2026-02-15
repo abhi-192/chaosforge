@@ -19,7 +19,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/organizations v1.31.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.57.1
 	github.com/aws/aws-sdk-go-v2/service/sfn v1.27.6
-	github.com/aws/aws-sdk-go-v2/service/sns v1.27.6
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.46.6
 	github.com/aws/aws-sdk-go-v2/service/sts v1.30.6
 	github.com/oklog/ulid/v2 v2.1.0

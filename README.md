@@ -14,115 +14,16 @@ It implements:
 
 ## Architecture
 
+> Diagrams are included as images (see `docs/diagrams/`) for maximum GitHub Markdown compatibility.
+
+
 ### High‑level diagram
 
-```mermaid
-flowchart LR
-  subgraph CP["Control Plane Account (single region)"]
-    APIGW["API Gateway HTTP API (AWS_IAM)"]
-    API["API Lambda (Run submission, approvals, kill-switch)"]
-    SFN["Step Functions: ChaosRunOrchestrator"]
-    DDB["DynamoDB (Runs, Events, Templates, Plugins, Policies, Approvals, Accounts)"]
-    S3["Evidence S3 Bucket (KMS encrypted)"]
-    SSM["SSM Parameter Store (/chaos/{env}/kill-switch)"]
-    CW["CloudWatch Alarms (control plane reads target alarms)"]
-    PLUG["Plugin Lambdas (in control plane)"]
-  end
-
-  subgraph ORG["AWS Organizations"]
-    OU["OUs"]
-    SS["Service-Managed StackSet (target-baseline.yaml)"]
-  end
-
-  subgraph TA["Target Accounts (many)"]
-    TR["IAM Roles via StackSet (ChaosTargetExecutionRole-EC2/SSM/ALB)"]
-    RES["Workloads: EC2, SSM-managed hosts, ALB/TGs, etc."]
-    ALM["CloudWatch Alarms (required + stop alarms)"]
-  end
-
-  APIGW --> API
-  API --> DDB
-  DDB --> API
-  API -->|StartExecution(runId)| SFN
-
-  SFN -->|invoke| PLUG
-  SFN -->|invoke| API
-  SFN --> DDB
-  DDB --> SFN
-  SFN --> SSM
-  SFN --> CW
-  SFN --> S3
-
-  SS -->|deploy roles| TR
-  OU --> SS
-
-  PLUG -->|AssumeRole + ExternalId| TR
-  TR --> RES
-  ALM --> CW
-```
+![High-level architecture diagram](docs/diagrams/high-level.png)
 
 ### Low‑level run lifecycle (sequence)
 
-```mermaid
-sequenceDiagram
-  participant User
-  participant API as API Lambda
-  participant DDB as DynamoDB
-  participant SFN as Step Functions
-  participant SSM as Parameter Store
-  participant CW as CloudWatch
-  participant Plan as Planner
-  participant Plug as Plugin Lambda(s)
-  participant Wait as ApprovalWaiter
-  participant Ops as Approver
-  participant Exec as PluginExecutor
-  participant Mon as Monitor
-  participant Rep as Reporter
-  participant S3 as Evidence S3
-
-  User->>API: POST /runs (templateId, env, accounts[], regions[], params)
-  API->>SSM: Check kill-switch (/chaos/{env}/kill-switch)
-  API->>DDB: Create Run + initial Events
-  API->>SFN: StartExecution(runId)
-
-  SFN->>DDB: LoadRun
-  SFN->>SSM: Check kill-switch (start gate)
-  SFN->>Plan: PlanTargets(runId)
-  Plan->>Plug: Invoke(plan) per account/region
-  Plug-->>Plan: targets + eligibleCounts + pluginState
-  Plan->>DDB: Persist plan + enforce blast-radius/policy
-  SFN->>CW: PreflightAlarms(required alarms stable)
-
-  alt Approval required (typically prod)
-    SFN->>Wait: Store taskToken + ApprovalRequested event
-    Wait->>DDB: Put Approval(taskToken)
-    Ops->>API: POST /approvals/{runId}/approve or /reject
-    API->>DDB: Get Approval(taskToken)
-    API->>SFN: SendTaskSuccess / SendTaskFailure
-  end
-
-  SFN->>Exec: Inject(runId)
-  Exec->>Plug: Invoke(inject)
-  Plug-->>Exec: inject result + evidence refs
-  Exec->>DDB: Append events + plugin state
-
-  loop MonitorLoop
-    SFN->>Mon: Monitor(runId)
-    Mon->>SSM: Check kill-switch
-    Mon->>CW: Check stop alarms
-    Mon-->>SFN: continue | rollback | abort
-  end
-
-  alt rollback/abort triggered
-    SFN->>Exec: Rollback(runId)
-    Exec->>Plug: Invoke(rollback)
-    SFN->>CW: PostCheck alarms
-  end
-
-  SFN->>Rep: Finalize(runId)
-  Rep->>S3: Write report.json + report.html
-  Rep->>DDB: Mark Run SUCCEEDED/FAILED/ABORTED
-```
+![Low-level run lifecycle diagram](docs/diagrams/low-level.png)
 
 ---
 

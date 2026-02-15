@@ -4,11 +4,13 @@ import (
 	"context"
 	"time"
 
-	"chaosforge/pkg/chaos/lambdautil"
 	"chaosforge/pkg/chaos/model"
+	"chaosforge/pkg/chaos/store"
 	"chaosforge/pkg/chaos/util"
 
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 )
 
 type input struct {
@@ -17,42 +19,35 @@ type input struct {
 }
 
 type output struct {
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
+	OK bool `json:"ok"`
 }
 
-type handler struct{ store modelStore }
-
-type modelStore interface {
-	GetRun(context.Context, string) (*model.ChaosRun, error)
-	UpdateRun(context.Context, *model.ChaosRun) error
-	PutEvent(context.Context, *model.ChaosRunEvent) error
+type handler struct {
+	st *store.DynamoStore
 }
 
 func main() {
 	util.InitLogger("abort")
-	cfg, err := lambdautil.LoadConfig(context.Background())
+	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		panic(err)
 	}
-	st := lambdautil.NewStoreFromEnv(cfg)
-	h := &handler{store: st}
-	lambda.Start(h.handle)
+	st := store.NewDynamo(dynamodb.NewFromConfig(cfg))
+	st.RunsTable = util.MustGetenv("CHAOS_RUNS_TABLE")
+	st.EventsTable = util.MustGetenv("CHAOS_EVENTS_TABLE")
+	lambda.Start((&handler{st: st}).Handle)
 }
 
-func (h *handler) handle(ctx context.Context, in input) (output, error) {
-	r, err := h.store.GetRun(ctx, in.RunID)
+func (h *handler) Handle(ctx context.Context, in input) (output, error) {
+	r, err := h.st.GetRun(ctx, in.RunID)
 	if err != nil {
-		return output{OK: false, Message: "run not found"}, nil
+		return output{OK: false}, err
 	}
-	r.State = model.RunAborted
-	if in.Reason == "" {
-		in.Reason = "ABORTED"
-	}
-	r.Outcome = in.Reason
 	now := time.Now().UTC()
-	r.FinishedAt = &now
-	_ = h.store.PutEvent(ctx, &model.ChaosRunEvent{RunID: r.RunID, Type: model.EventAbort, Message: "Run aborted", Details: map[string]any{"reason": in.Reason}})
-	_ = h.store.UpdateRun(ctx, r)
-	return output{OK: true, Message: "aborted"}, nil
+	r.State = model.RunAborted
+	r.Outcome = "ABORTED"
+	r.EndedAt = &now
+	_ = h.st.UpdateRun(ctx, r)
+	_ = h.st.PutEvent(ctx, &model.ChaosRunEvent{RunID: r.RunID, Type: model.EventFinal, Message: "Run aborted", Details: map[string]any{"reason": in.Reason}})
+	return output{OK: true}, nil
 }

@@ -17,8 +17,8 @@ type Config struct {
 	TargetAccounts   []TargetAccount   `yaml:"targetAccounts"`
 	ExternalIDFormat string            `yaml:"externalIdFormat"`
 	Policies         map[string]Policy `yaml:"policies"` // env -> policy
-	Plugins          []PluginDef       `yaml:"plugins"`
-	Templates        []TemplateSeed    `yaml:"templates"`
+	Plugins          []PluginDef        `yaml:"plugins"`
+	Templates        []TemplateSeed     `yaml:"templates"`
 }
 
 type ControlPlane struct {
@@ -30,19 +30,19 @@ type ControlPlane struct {
 		Prefix string `yaml:"prefix"`
 	} `yaml:"artifacts"`
 	Evidence struct {
-		Bucket    string `yaml:"bucket"`
+		Bucket   string `yaml:"bucket"`
 		KMSKeyArn string `yaml:"kmsKeyArn"`
 	} `yaml:"evidence"`
 	ApiEndpoint string `yaml:"apiEndpoint"` // filled after deploy
 }
 
 type StackSets struct {
-	PermissionModel       string   `yaml:"permissionModel"`
-	StackSetName          string   `yaml:"stackSetName"`
-	OrganizationalUnitIDs []string `yaml:"organizationalUnitIds"`
-	Regions               []string `yaml:"regions"`
-	AutoDeployment        struct {
-		Enabled                      bool `yaml:"enabled"`
+	PermissionModel        string   `yaml:"permissionModel"`
+	StackSetName           string   `yaml:"stackSetName"`
+	OrganizationalUnitIDs  []string `yaml:"organizationalUnitIds"`
+	Regions                []string `yaml:"regions"`
+	AutoDeployment         struct {
+		Enabled                    bool `yaml:"enabled"`
 		RetainStacksOnAccountRemoval bool `yaml:"retainStacksOnAccountRemoval"`
 	} `yaml:"autoDeployment"`
 	ManagedExecution struct {
@@ -60,15 +60,15 @@ type TargetAccount struct {
 }
 
 type Policy struct {
-	Version                int                         `yaml:"version"`
-	RequireApproval        bool                        `yaml:"requireApproval"`
-	MaxRunDurationSeconds  int                         `yaml:"maxRunDurationSeconds"`
-	PreflightWindowSeconds int                         `yaml:"preflightWindowSeconds"`
-	BlastRadiusLimits      map[string]BlastRadiusLimit `yaml:"blastRadiusLimits"`
-	AllowedPlugins         []string                    `yaml:"allowedPlugins"`
-	RequiredTags           map[string]string           `yaml:"requiredTags"`
-	DenyTags               map[string]string           `yaml:"denyTags"`
-	FreezeWindows          []FreezeWindow              `yaml:"freezeWindows"`
+	Version              int                          `yaml:"version"`
+	RequireApproval      bool                         `yaml:"requireApproval"`
+	MaxRunDurationSeconds int                         `yaml:"maxRunDurationSeconds"`
+	PreflightWindowSeconds int                        `yaml:"preflightWindowSeconds"`
+	BlastRadiusLimits     map[string]BlastRadiusLimit `yaml:"blastRadiusLimits"`
+	AllowedPlugins        []string                    `yaml:"allowedPlugins"`
+	RequiredTags          map[string]string           `yaml:"requiredTags"`
+	DenyTags              map[string]string           `yaml:"denyTags"`
+	FreezeWindows         []FreezeWindow              `yaml:"freezeWindows"`
 }
 
 type BlastRadiusLimit struct {
@@ -77,11 +77,11 @@ type BlastRadiusLimit struct {
 }
 
 type FreezeWindow struct {
-	Name       string   `yaml:"name"`
-	TZ         string   `yaml:"tz"`
+	Name      string   `yaml:"name"`
+	TZ        string   `yaml:"tz"`
 	DaysOfWeek []string `yaml:"daysOfWeek"`
-	Start      string   `yaml:"start"`
-	End        string   `yaml:"end"`
+	Start     string   `yaml:"start"`
+	End       string   `yaml:"end"`
 }
 
 type PluginDef struct {
@@ -94,17 +94,17 @@ type PluginDef struct {
 }
 
 type TemplateSeed struct {
-	TemplateID     string         `yaml:"templateId"`
-	Version        int            `yaml:"version"`
-	Name           string         `yaml:"name"`
-	Description    string         `yaml:"description"`
-	EnvScope       string         `yaml:"envScope"`  // dev|prod|any
-	Status         string         `yaml:"status"`    // DRAFT|APPROVED|DEPRECATED
-	PluginRef      string         `yaml:"pluginRef"` // <pluginId>@<version>
-	RequiredAlarms []string       `yaml:"requiredAlarms"`
-	StopAlarms     []string       `yaml:"stopAlarms"`
-	DefaultParams  map[string]any `yaml:"defaultParams"`
-	ParamsSchema   map[string]any `yaml:"paramsSchema"`
+	TemplateID     string                 `yaml:"templateId"`
+	Version        int                    `yaml:"version"`
+	Name           string                 `yaml:"name"`
+	Description    string                 `yaml:"description"`
+	EnvScope       string                 `yaml:"envScope"` // dev|prod|any
+	Status         string                 `yaml:"status"`  // DRAFT|APPROVED|DEPRECATED
+	PluginRef      string                 `yaml:"pluginRef"` // <pluginId>@<version>
+	RequiredAlarms []string               `yaml:"requiredAlarms"`
+	StopAlarms     []string               `yaml:"stopAlarms"`
+	DefaultParams  map[string]any         `yaml:"defaultParams"`
+	ParamsSchema   map[string]any         `yaml:"paramsSchema"`
 }
 
 func Load(path string) (*Config, error) {

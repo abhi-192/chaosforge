@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"chaosforge/pkg/chaos/model"
-	"chaosforge/pkg/chaos/notify"
-	"chaosforge/pkg/chaos/policy"
 	"chaosforge/pkg/chaos/store"
 	"chaosforge/pkg/chaos/util"
 
@@ -26,10 +24,9 @@ import (
 )
 
 type deps struct {
-	store  store.Store
-	sfn    *sfn.Client
-	ssm    *ssm.Client
-	notify notify.Notifier
+	store store.Store
+	sfn   *sfn.Client
+	ssm   *ssm.Client
 
 	sfnArn string
 }
@@ -50,15 +47,10 @@ func main() {
 	st.AccountsTable = util.MustGetenv("CHAOS_ACCOUNTS_TABLE")
 	st.PoliciesTable = util.MustGetenv("CHAOS_POLICIES_TABLE")
 
-	n, err := notify.NewFromEnv(cfg, nil)
-	if err != nil {
-		panic(err)
-	}
 	d := &deps{
-		store:  st,
-		sfn:    sfn.NewFromConfig(cfg),
-		ssm:    ssm.NewFromConfig(cfg),
-		notify: n,
+		store: st,
+		sfn:   sfn.NewFromConfig(cfg),
+		ssm:   ssm.NewFromConfig(cfg),
 		sfnArn: util.MustGetenv("CHAOS_SFN_ARN"),
 	}
 	lambda.Start(d.handler)
@@ -130,40 +122,24 @@ func (d *deps) postRun(ctx context.Context, req events.APIGatewayV2HTTPRequest) 
 	if err != nil {
 		return util.Err(400, fmt.Sprintf("policy not found for env %s", in.Env))
 	}
-	// Freeze window enforcement (policy)
-	if err := policy.EvaluateFreezeWindows(time.Now().UTC(), pol.FreezeWindows); err != nil {
-		return util.Err(403, err.Error())
-	}
-	// Kill-switch: refuse to start new runs when engaged.
-	if engaged, err := d.killSwitchEngaged(ctx, in.Env); err == nil && engaged {
-		return util.Err(409, "kill-switch is ENGAGED for this env")
-	}
 	tpl, err := d.store.GetTemplate(ctx, in.TemplateID, in.TemplateVersion)
 	if err != nil {
 		return util.Err(400, "template not found")
-	}
-	if tpl.Status != model.TemplateApproved {
-		return util.Err(409, "template is not APPROVED")
-	}
-	if tpl.EnvScope != "" && tpl.EnvScope != "any" && tpl.EnvScope != in.Env {
-		return util.Err(403, fmt.Sprintf("template envScope=%s does not allow env=%s", tpl.EnvScope, in.Env))
 	}
 	pluginID, pluginVer, err := model.ParsePluginRef(tpl.PluginRef)
 	if err != nil {
 		return util.Err(500, err.Error())
 	}
-	if err := policy.EnforceAllowedPlugins(pluginID, pol.AllowedPlugins); err != nil {
-		return util.Err(403, err.Error())
+	// allowedPlugins check
+	allowed := false
+	for _, p := range pol.AllowedPlugins {
+		if p == pluginID {
+			allowed = true
+			break
+		}
 	}
-	// Required/deny tag scoping
-	mergedParams, err := policy.EnsureTagScoping(in.Params, pol.RequiredTags, pol.DenyTags)
-	if err != nil {
-		return util.Err(403, err.Error())
-	}
-	in.Params = mergedParams
-	// Account + region allowlist (from account onboarding state)
-	if err := d.enforceAccountsAndRegions(ctx, in.Accounts, in.Regions); err != nil {
-		return util.Err(403, err.Error())
+	if !allowed {
+		return util.Err(403, "plugin not allowed by policy")
 	}
 
 	runID := util.NewRunID()
@@ -199,17 +175,6 @@ func (d *deps) postRun(ctx context.Context, req events.APIGatewayV2HTTPRequest) 
 		Message: fmt.Sprintf("Run created by %s using %s@%d", who, pluginID, pluginVer),
 		Details: map[string]any{"templateId": in.TemplateID, "templateVersion": in.TemplateVersion},
 	})
-	// Notifications (best-effort)
-	if d.notify != nil {
-		m := notify.Message{Type: "RUN_CREATED", Env: r.Env, RunID: r.RunID, Text: fmt.Sprintf("ChaosForge run created: %s (env=%s)", r.RunID, r.Env), Fields: map[string]string{"template": fmt.Sprintf("%s@%d", r.TemplateID, r.TemplateVersion)}}
-		if r.ApprovalRequired {
-			m.Type = "APPROVAL_REQUIRED"
-			m.Text = fmt.Sprintf("ChaosForge approval required: run %s (env=%s)", r.RunID, r.Env)
-		}
-		if err := d.notify.Notify(ctx, m); err != nil {
-			log.Warn().Err(err).Msg("notify failed")
-		}
-	}
 
 	// start Step Functions execution
 	input := fmt.Sprintf("{\"runId\":%q}", runID)
@@ -295,39 +260,6 @@ func (d *deps) setKillSwitch(ctx context.Context, req events.APIGatewayV2HTTPReq
 		return util.Err(500, "failed to set kill-switch")
 	}
 	return util.JSON(200, map[string]any{"ok": true, "env": env, "value": value})
-}
-
-func (d *deps) killSwitchEngaged(ctx context.Context, env string) (bool, error) {
-	name := fmt.Sprintf("/chaos/%s/kill-switch", env)
-	out, err := d.ssm.GetParameter(ctx, &ssm.GetParameterInput{Name: aws.String(name), WithDecryption: aws.Bool(false)})
-	if err != nil {
-		return false, err
-	}
-	return strings.EqualFold(aws.ToString(out.Parameter.Value), "ENGAGED"), nil
-}
-
-func (d *deps) enforceAccountsAndRegions(ctx context.Context, accounts []string, regions []string) error {
-	for _, acct := range accounts {
-		a, err := d.store.GetAccount(ctx, acct)
-		if err != nil {
-			return fmt.Errorf("account %s is not onboarded in ChaosAccounts", acct)
-		}
-		if !a.Enabled {
-			return fmt.Errorf("account %s is disabled", acct)
-		}
-		if len(a.AllowedRegions) > 0 {
-			allowed := map[string]bool{}
-			for _, r := range a.AllowedRegions {
-				allowed[r] = true
-			}
-			for _, r := range regions {
-				if !allowed[r] {
-					return fmt.Errorf("region %s not allowed for account %s", r, acct)
-				}
-			}
-		}
-	}
-	return nil
 }
 
 func parseQuery(raw string) url.Values {

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sort"
 
 	"chaosforge/pkg/chaos/model"
@@ -10,10 +12,11 @@ import (
 	"chaosforge/pkg/chaos/util"
 
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbtypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 )
+
+type plugin struct{ rt *pluginutil.Runtime }
 
 func main() {
 	util.InitLogger("plugin-alb-blackhole")
@@ -21,138 +24,181 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	lambda.Start(func(ctx context.Context, req model.PluginRequest) (model.PluginResponse, error) {
-		return handle(ctx, rt, req)
-	})
+	lambda.Start((&plugin{rt: rt}).Handle)
 }
 
-func handle(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
+func (p *plugin) Handle(ctx context.Context, req model.PluginRequest) (model.PluginResponse, error) {
 	switch req.Action {
 	case model.PluginPlan:
-		return plan(ctx, rt, req)
+		return p.plan(ctx, req)
 	case model.PluginInject:
-		return inject(ctx, rt, req)
+		return p.apply(ctx, req, true)
 	case model.PluginRollback:
-		return rollback(ctx, rt, req)
+		return p.apply(ctx, req, false)
 	default:
-		return model.PluginResponse{OK: true, Message: "noop"}, nil
+		return model.PluginResponse{OK: false, Message: "unsupported action"}, nil
 	}
 }
 
-func plan(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
-	maxTargets := pluginutil.GetIntParam(req.Params, "maxTargets", 1)
-	arns := getTGArns(req.Params)
-	if len(arns) == 0 {
-		return model.PluginResponse{OK: false, Message: "targetGroupArn(s) param required"}, nil
+type params struct {
+	TargetGroupTags map[string]string `json:"targetGroupTags"`
+	MaxTargets      int              `json:"maxTargets"`
+}
+
+func parseParams(m map[string]any) params {
+	b, _ := json.Marshal(m)
+	var p params
+	_ = json.Unmarshal(b, &p)
+	if p.MaxTargets <= 0 {
+		p.MaxTargets = 1
 	}
-	eligible := []model.Target{}
+	if p.TargetGroupTags == nil {
+		p.TargetGroupTags = map[string]string{}
+	}
+	return p
+}
+
+func (p *plugin) plan(ctx context.Context, req model.PluginRequest) (model.PluginResponse, error) {
+	prm := parseParams(req.Params)
+	candidates := make([]model.Target, 0)
+	selectedTG := ""
+	selectedAcct := ""
+	selectedRegion := ""
+
 	for _, acct := range req.Accounts {
 		for _, region := range req.Regions {
-			cfg, err := rt.AssumeTarget(ctx, acct, "alb", req.Env, region)
+			cfg, err := p.rt.AssumeTarget(ctx, acct, "alb", req.Env, region)
 			if err != nil {
-				continue
+				return model.PluginResponse{OK: false, Message: err.Error()}, nil
 			}
 			elbc := elasticloadbalancingv2.NewFromConfig(cfg)
-			for _, tg := range arns {
-				th, err := elbc.DescribeTargetHealth(ctx, &elasticloadbalancingv2.DescribeTargetHealthInput{TargetGroupArn: aws.String(tg)})
-				if err != nil {
+			tgOut, err := elbc.DescribeTargetGroups(ctx, &elasticloadbalancingv2.DescribeTargetGroupsInput{})
+			if err != nil {
+				return model.PluginResponse{OK: false, Message: err.Error()}, nil
+			}
+			for _, tg := range tgOut.TargetGroups {
+				arn := deref(tg.TargetGroupArn)
+				if arn == "" {
 					continue
 				}
-				for _, d := range th.TargetHealthDescriptions {
-					// only healthy targets
-					if d.TargetHealth != nil && d.TargetHealth.State != elbtypes.TargetHealthStateEnumHealthy {
+				if len(prm.TargetGroupTags) > 0 {
+					tagsOut, err := elbc.DescribeTags(ctx, &elasticloadbalancingv2.DescribeTagsInput{ResourceArns: []string{arn}})
+					if err != nil {
+						return model.PluginResponse{OK: false, Message: err.Error()}, nil
+					}
+					match := true
+					if len(tagsOut.TagDescriptions) > 0 {
+						m := map[string]string{}
+						for _, tag := range tagsOut.TagDescriptions[0].Tags {
+							m[deref(tag.Key)] = deref(tag.Value)
+						}
+						for k, v := range prm.TargetGroupTags {
+							if m[k] != v {
+								match = false
+								break
+							}
+						}
+					}
+					if !match {
 						continue
 					}
-					id := aws.ToString(d.Target.Id)
-					port := int(aws.ToInt32(d.Target.Port))
-					eligible = append(eligible, model.Target{AccountID: acct, Region: region, Type: "alb-target", ID: fmt.Sprintf("%s:%d", id, port), Meta: map[string]any{"targetGroupArn": tg, "targetId": id, "port": port}})
 				}
+				// pick first matching TG
+				selectedTG = arn
+				selectedAcct = acct
+				selectedRegion = region
+				break
+			}
+			if selectedTG != "" {
+				break
 			}
 		}
-	}
-	sort.Slice(eligible, func(i, j int) bool {
-		if eligible[i].AccountID != eligible[j].AccountID {
-			return eligible[i].AccountID < eligible[j].AccountID
+		if selectedTG != "" {
+			break
 		}
-		if eligible[i].Region != eligible[j].Region {
-			return eligible[i].Region < eligible[j].Region
-		}
-		return eligible[i].ID < eligible[j].ID
-	})
-	sel := eligible
-	if maxTargets > 0 && len(sel) > maxTargets {
-		sel = sel[:maxTargets]
 	}
-	return model.PluginResponse{OK: true, Message: "planned", Targets: sel, State: map[string]any{"eligible": len(eligible), "selected": len(sel)}}, nil
+
+	if selectedTG == "" {
+		return model.PluginResponse{OK: false, Message: "no matching target group found"}, nil
+	}
+
+	cfg, err := p.rt.AssumeTarget(ctx, selectedAcct, "alb", req.Env, selectedRegion)
+	if err != nil {
+		return model.PluginResponse{OK: false, Message: err.Error()}, nil
+	}
+	elbc := elasticloadbalancingv2.NewFromConfig(cfg)
+	health, err := elbc.DescribeTargetHealth(ctx, &elasticloadbalancingv2.DescribeTargetHealthInput{TargetGroupArn: &selectedTG})
+	if err != nil {
+		return model.PluginResponse{OK: false, Message: err.Error()}, nil
+	}
+	for _, th := range health.TargetHealthDescriptions {
+		id := deref(th.Target.Id)
+		port := int32(0)
+		if th.Target.Port != nil {
+			port = *th.Target.Port
+		}
+		candidates = append(candidates, model.Target{AccountID: selectedAcct, Region: selectedRegion, Type: "ALB_TARGET", ID: id, Meta: map[string]string{"targetGroupArn": selectedTG, "port": fmt.Sprintf("%d", port)}})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	if len(candidates) > prm.MaxTargets {
+		candidates = candidates[:prm.MaxTargets]
+	}
+	state := map[string]any{"targetGroupArn": selectedTG, "targets": candidates}
+	return model.PluginResponse{OK: true, Targets: candidates, State: state, Message: fmt.Sprintf("selected %d targets in TG", len(candidates))}, nil
 }
 
-func inject(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
+func (p *plugin) apply(ctx context.Context, req model.PluginRequest, inject bool) (model.PluginResponse, error) {
+	// group by TG + acct + region
+	groups := map[string][]elbtypes.TargetDescription{}
 	for _, t := range req.Targets {
-		tg, _ := t.Meta["targetGroupArn"].(string)
-		id, _ := t.Meta["targetId"].(string)
-		port := intFromAny(t.Meta["port"], 0)
-		if tg == "" || id == "" || port == 0 {
+		tg := ""
+		port := int32(0)
+		if t.Meta != nil {
+			tg = t.Meta["targetGroupArn"]
+			if t.Meta["port"] != "" {
+				var tmp int
+				_, _ = fmt.Sscanf(t.Meta["port"], "%d", &tmp)
+				port = int32(tmp)
+			}
+		}
+		key := fmt.Sprintf("%s|%s|%s", t.AccountID, t.Region, tg)
+		id := t.ID
+		p := port
+		groups[key] = append(groups[key], elbtypes.TargetDescription{Id: &id, Port: &p})
+	}
+	for key, targets := range groups {
+		parts := strings.SplitN(key, "|", 3)
+		if len(parts) != 3 {
 			continue
 		}
-		cfg, err := rt.AssumeTarget(ctx, t.AccountID, "alb", req.Env, t.Region)
+		acct, region, tg := parts[0], parts[1], parts[2]
+		if acct == "" || region == "" || tg == "" {
+			continue
+		}
+		cfg, err := p.rt.AssumeTarget(ctx, acct, "alb", req.Env, region)
 		if err != nil {
 			return model.PluginResponse{OK: false, Message: err.Error()}, nil
 		}
 		elbc := elasticloadbalancingv2.NewFromConfig(cfg)
-		_, err = elbc.DeregisterTargets(ctx, &elasticloadbalancingv2.DeregisterTargetsInput{TargetGroupArn: aws.String(tg), Targets: []elbtypes.TargetDescription{{Id: aws.String(id), Port: aws.Int32(int32(port))}}})
+		if inject {
+			_, err = elbc.DeregisterTargets(ctx, &elasticloadbalancingv2.DeregisterTargetsInput{TargetGroupArn: &tg, Targets: targets})
+		} else {
+			_, err = elbc.RegisterTargets(ctx, &elasticloadbalancingv2.RegisterTargetsInput{TargetGroupArn: &tg, Targets: targets})
+		}
 		if err != nil {
 			return model.PluginResponse{OK: false, Message: err.Error()}, nil
 		}
 	}
-	return model.PluginResponse{OK: true, Message: "deregistered", State: req.State}, nil
+	msg := "rollback"
+	if inject {
+		msg = "blackhole"
+	}
+	return model.PluginResponse{OK: true, Message: msg}, nil
 }
 
-func rollback(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
-	for _, t := range req.Targets {
-		tg, _ := t.Meta["targetGroupArn"].(string)
-		id, _ := t.Meta["targetId"].(string)
-		port := intFromAny(t.Meta["port"], 0)
-		if tg == "" || id == "" || port == 0 {
-			continue
-		}
-		cfg, err := rt.AssumeTarget(ctx, t.AccountID, "alb", req.Env, t.Region)
-		if err != nil {
-			continue
-		}
-		elbc := elasticloadbalancingv2.NewFromConfig(cfg)
-		_, _ = elbc.RegisterTargets(ctx, &elasticloadbalancingv2.RegisterTargetsInput{TargetGroupArn: aws.String(tg), Targets: []elbtypes.TargetDescription{{Id: aws.String(id), Port: aws.Int32(int32(port))}}})
+func deref(p *string) string {
+	if p == nil {
+		return ""
 	}
-	return model.PluginResponse{OK: true, Message: "registered", State: req.State}, nil
-}
-
-func intFromAny(v any, def int) int {
-	switch t := v.(type) {
-	case int:
-		return t
-	case int64:
-		return int(t)
-	case float64:
-		return int(t)
-	default:
-		return def
-	}
-}
-
-func getTGArns(params map[string]any) []string {
-	if params == nil {
-		return nil
-	}
-	if v, ok := params["targetGroupArn"].(string); ok && v != "" {
-		return []string{v}
-	}
-	if v, ok := params["targetGroupArns"].([]any); ok {
-		out := []string{}
-		for _, x := range v {
-			if s, ok := x.(string); ok && s != "" {
-				out = append(out, s)
-			}
-		}
-		return out
-	}
-	return nil
+	return *p
 }

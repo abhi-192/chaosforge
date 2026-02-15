@@ -12,8 +12,8 @@ import (
 )
 
 type Writer struct {
-	s3        *s3.Client
-	bucket    string
+	s3       *s3.Client
+	bucket   string
 	kmsKeyArn string
 }
 

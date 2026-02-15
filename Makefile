@@ -56,7 +56,5 @@ tools:
 	@mkdir -p bin
 	@echo "Building CLI tools..."
 	GOOS=$$(go env GOOS) GOARCH=$$(go env GOARCH) CGO_ENABLED=$(CGO_ENABLED) go build -trimpath -ldflags "-s -w" -o bin/chaosforge ./cmd/chaosforge
-	GOOS=$$(go env GOOS) GOARCH=$$(go env GOARCH) CGO_ENABLED=$(CGO_ENABLED) go build -trimpath -ldflags "-s -w" -o bin/chaosctl ./cmd/chaosctl
 	@echo "  - bin/chaosforge"
-	@echo "  - bin/chaosctl"
 

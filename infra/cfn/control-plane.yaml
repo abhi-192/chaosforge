@@ -17,20 +17,8 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true','false']
 
-  NotifySnsTopicArn:
-    Type: String
-    Default: ""
-    Description: Optional SNS topic ARN for ChatOps notifications
-
-  SlackWebhookParam:
-    Type: String
-    Default: ""
-    Description: Optional SSM parameter name (SecureString) with Slack incoming webhook URL
-
 Conditions:
   CreateApi: !Equals [!Ref EnableApi, 'true']
-  HasNotifyTopic: !Not [!Equals [!Ref NotifySnsTopicArn, ""]]
-  HasSlackParam: !Not [!Equals [!Ref SlackWebhookParam, ""]]
 
 Resources:
   EvidenceKey:
@@ -259,14 +247,6 @@ Resources:
                   - kms:Encrypt
                   - kms:GenerateDataKey
                 Resource: !GetAtt EvidenceKey.Arn
-              - !If
-                - HasNotifyTopic
-                - Sid: NotifyPublish
-                  Effect: Allow
-                  Action:
-                    - sns:Publish
-                  Resource: !Ref NotifySnsTopicArn
-                - !Ref AWS::NoValue
 
   PluginLambdaRole:
     Type: AWS::IAM::Role
@@ -321,8 +301,6 @@ Resources:
           CHAOS_ACCOUNTS_TABLE: !Ref AccountsTable
           CHAOS_POLICIES_TABLE: !Ref PoliciesTable
           CHAOS_SFN_ARN: !Ref Orchestrator
-          CHAOS_NOTIFY_SNS_TOPIC_ARN: !Ref NotifySnsTopicArn
-          CHAOS_NOTIFY_SLACK_WEBHOOK_PARAM: !Ref SlackWebhookParam
 
   PlannerFunction:
     Type: AWS::Lambda::Function
@@ -379,8 +357,6 @@ Resources:
           CHAOS_APPROVALS_TABLE: !Ref ApprovalsTable
           CHAOS_RUNS_TABLE: !Ref RunsTable
           CHAOS_EVENTS_TABLE: !Ref EventsTable
-          CHAOS_NOTIFY_SNS_TOPIC_ARN: !Ref NotifySnsTopicArn
-          CHAOS_NOTIFY_SLACK_WEBHOOK_PARAM: !Ref SlackWebhookParam
 
   PluginExecutorFunction:
     Type: AWS::Lambda::Function
@@ -438,8 +414,6 @@ Resources:
           CHAOS_EVENTS_TABLE: !Ref EventsTable
           CHAOS_EVIDENCE_BUCKET: !Ref EvidenceBucket
           CHAOS_EVIDENCE_KMS_KEY_ARN: !GetAtt EvidenceKey.Arn
-          CHAOS_NOTIFY_SNS_TOPIC_ARN: !Ref NotifySnsTopicArn
-          CHAOS_NOTIFY_SLACK_WEBHOOK_PARAM: !Ref SlackWebhookParam
 
   AbortFunction:
     Type: AWS::Lambda::Function

@@ -2,19 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sort"
-	"time"
 
 	"chaosforge/pkg/chaos/model"
 	"chaosforge/pkg/chaos/pluginutil"
 	"chaosforge/pkg/chaos/util"
 
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	"github.com/rs/zerolog/log"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
+
+type plugin struct {
+	rt *pluginutil.Runtime
+}
 
 func main() {
 	util.InitLogger("plugin-ec2-stop")
@@ -22,110 +25,106 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	lambda.Start(func(ctx context.Context, req model.PluginRequest) (model.PluginResponse, error) {
-		return handle(ctx, rt, req)
-	})
+	lambda.Start((&plugin{rt: rt}).Handle)
 }
 
-func handle(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
+func (p *plugin) Handle(ctx context.Context, req model.PluginRequest) (model.PluginResponse, error) {
 	switch req.Action {
 	case model.PluginPlan:
-		return plan(ctx, rt, req)
+		return p.plan(ctx, req)
 	case model.PluginInject:
-		return inject(ctx, rt, req)
+		return p.inject(ctx, req, true)
 	case model.PluginRollback:
-		return rollback(ctx, rt, req)
+		return p.inject(ctx, req, false)
 	default:
-		return model.PluginResponse{OK: true, Message: "noop"}, nil
+		return model.PluginResponse{OK: false, Message: "unsupported action"}, nil
 	}
 }
 
-func plan(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
-	maxTargets := pluginutil.GetIntParam(req.Params, "maxTargets", 1)
-	tags, err := pluginutil.GetStringMapParam(req.Params, "targetTags")
-	if err != nil {
-		return model.PluginResponse{OK: false, Message: err.Error()}, nil
+type params struct {
+	TargetTags map[string]string `json:"targetTags"`
+	MaxTargets int              `json:"maxTargets"`
+}
+
+func parseParams(m map[string]any) params {
+	b, _ := json.Marshal(m)
+	var p params
+	_ = json.Unmarshal(b, &p)
+	if p.MaxTargets <= 0 {
+		p.MaxTargets = 1
 	}
-	eligible := []model.Target{}
+	if p.TargetTags == nil {
+		p.TargetTags = map[string]string{}
+	}
+	return p
+}
+
+func (p *plugin) plan(ctx context.Context, req model.PluginRequest) (model.PluginResponse, error) {
+	prm := parseParams(req.Params)
+	candidates := make([]model.Target, 0)
+
 	for _, acct := range req.Accounts {
 		for _, region := range req.Regions {
-			cfg, err := rt.AssumeTarget(ctx, acct, "ec2", req.Env, region)
+			cfg, err := p.rt.AssumeTarget(ctx, acct, "ec2", req.Env, region)
 			if err != nil {
-				log.Warn().Err(err).Str("account", acct).Str("region", region).Msg("assume")
-				continue
+				return model.PluginResponse{OK: false, Message: err.Error()}, nil
 			}
 			ec2c := ec2.NewFromConfig(cfg)
-			filters := []types.Filter{{Name: strp("instance-state-name"), Values: []string{"running"}}}
-			for k, v := range tags {
-				if v == "" {
-					filters = append(filters, types.Filter{Name: strp("tag-key"), Values: []string{k}})
-				} else {
-					filters = append(filters, types.Filter{Name: strp("tag:" + k), Values: []string{v}})
-				}
+			filters := []ec2types.Filter{{Name: strPtr("instance-state-name"), Values: []string{"running"}}}
+			for k, v := range prm.TargetTags {
+				filters = append(filters, ec2types.Filter{Name: strPtr(fmt.Sprintf("tag:%s", k)), Values: []string{v}})
 			}
-			p := ec2.NewDescribeInstancesPaginator(ec2c, &ec2.DescribeInstancesInput{Filters: filters})
-			for p.HasMorePages() {
-				page, err := p.NextPage(ctx)
-				if err != nil {
-					log.Warn().Err(err).Msg("describe instances")
-					break
-				}
-				for _, res := range page.Reservations {
-					for _, inst := range res.Instances {
-						id := aws.ToString(inst.InstanceId)
-						eligible = append(eligible, model.Target{AccountID: acct, Region: region, Type: "ec2-instance", ID: id})
-					}
+			out, err := ec2c.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: filters})
+			if err != nil {
+				return model.PluginResponse{OK: false, Message: err.Error()}, nil
+			}
+			for _, res := range out.Reservations {
+				for _, inst := range res.Instances {
+					candidates = append(candidates, model.Target{AccountID: acct, Region: region, Type: "EC2_INSTANCE", ID: *inst.InstanceId, Meta: map[string]string{}})
 				}
 			}
 		}
 	}
-	// Deterministic pick
-	sort.Slice(eligible, func(i, j int) bool {
-		if eligible[i].AccountID != eligible[j].AccountID {
-			return eligible[i].AccountID < eligible[j].AccountID
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].AccountID == candidates[j].AccountID {
+			if candidates[i].Region == candidates[j].Region {
+				return candidates[i].ID < candidates[j].ID
+			}
+			return candidates[i].Region < candidates[j].Region
 		}
-		if eligible[i].Region != eligible[j].Region {
-			return eligible[i].Region < eligible[j].Region
-		}
-		return eligible[i].ID < eligible[j].ID
+		return candidates[i].AccountID < candidates[j].AccountID
 	})
-	sel := eligible
-	if maxTargets > 0 && len(sel) > maxTargets {
-		sel = sel[:maxTargets]
+
+	if len(candidates) > prm.MaxTargets {
+		candidates = candidates[:prm.MaxTargets]
 	}
-	return model.PluginResponse{OK: true, Message: "planned", Targets: sel, State: map[string]any{"eligible": len(eligible), "selected": len(sel)}}, nil
+
+	state := map[string]any{"instances": candidates, "roleType": "ec2"}
+	return model.PluginResponse{OK: true, Targets: candidates, State: state, Message: fmt.Sprintf("selected %d instances", len(candidates))}, nil
 }
 
-func inject(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
+func (p *plugin) inject(ctx context.Context, req model.PluginRequest, stop bool) (model.PluginResponse, error) {
 	for _, t := range req.Targets {
-		cfg, err := rt.AssumeTarget(ctx, t.AccountID, "ec2", req.Env, t.Region)
+		cfg, err := p.rt.AssumeTarget(ctx, t.AccountID, "ec2", req.Env, t.Region)
 		if err != nil {
 			return model.PluginResponse{OK: false, Message: err.Error()}, nil
 		}
 		ec2c := ec2.NewFromConfig(cfg)
-		_, err = ec2c.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: []string{t.ID}})
+		if stop {
+			_, err = ec2c.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: []string{t.ID}})
+		} else {
+			_, err = ec2c.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{t.ID}})
+		}
 		if err != nil {
 			return model.PluginResponse{OK: false, Message: err.Error()}, nil
 		}
 	}
-	// allow a short settle; plugins should generally be async.
-	_ = time.Now()
-	return model.PluginResponse{OK: true, Message: "stopped", State: req.State}, nil
-}
-
-func rollback(ctx context.Context, rt *pluginutil.Runtime, req model.PluginRequest) (model.PluginResponse, error) {
-	for _, t := range req.Targets {
-		cfg, err := rt.AssumeTarget(ctx, t.AccountID, "ec2", req.Env, t.Region)
-		if err != nil {
-			return model.PluginResponse{OK: false, Message: err.Error()}, nil
-		}
-		ec2c := ec2.NewFromConfig(cfg)
-		_, err = ec2c.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{t.ID}})
-		if err != nil {
-			return model.PluginResponse{OK: false, Message: err.Error()}, nil
-		}
+	msg := "stopped"
+	if !stop {
+		msg = "started"
 	}
-	return model.PluginResponse{OK: true, Message: "started", State: req.State}, nil
+	return model.PluginResponse{OK: true, Message: msg}, nil
 }
 
-func strp(s string) *string { return &s }
+func strPtr(s string) *string { return &s }

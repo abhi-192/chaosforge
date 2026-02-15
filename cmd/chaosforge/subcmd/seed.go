@@ -164,25 +164,25 @@ func seedPolicies(ctx context.Context, st *store.DynamoStore, c *config.Config) 
 		fw := make([]any, 0, len(p.FreezeWindows))
 		for _, w := range p.FreezeWindows {
 			fw = append(fw, map[string]any{
-				"name":       w.Name,
-				"tz":         w.TZ,
+				"name":      w.Name,
+				"tz":        w.TZ,
 				"daysOfWeek": w.DaysOfWeek,
-				"start":      w.Start,
-				"end":        w.End,
+				"start":     w.Start,
+				"end":       w.End,
 			})
 		}
 		pol := &model.ChaosPolicy{
-			Env:                    env,
-			Version:                p.Version,
-			BlastRadiusLimits:      br,
-			AllowedPlugins:         p.AllowedPlugins,
-			FreezeWindows:          fw,
-			RequireApproval:        p.RequireApproval,
-			RequiredTags:           p.RequiredTags,
-			DenyTags:               p.DenyTags,
-			MaxRunDurationSeconds:  p.MaxRunDurationSeconds,
+			Env:                   env,
+			Version:               p.Version,
+			BlastRadiusLimits:     br,
+			AllowedPlugins:        p.AllowedPlugins,
+			FreezeWindows:         fw,
+			RequireApproval:       p.RequireApproval,
+			RequiredTags:          p.RequiredTags,
+			DenyTags:              p.DenyTags,
+			MaxRunDurationSeconds: p.MaxRunDurationSeconds,
 			PreflightWindowSeconds: p.PreflightWindowSeconds,
-			CreatedAt:              now,
+			CreatedAt:             now,
 		}
 		if err := st.PutPolicy(ctx, pol); err != nil {
 			return fmt.Errorf("put policy %s: %w", env, err)
